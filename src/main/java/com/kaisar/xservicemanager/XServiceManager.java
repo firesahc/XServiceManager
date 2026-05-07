@@ -57,24 +57,34 @@ public final class XServiceManager {
             Object serviceManagerDelegate = Proxy.newProxyInstance(IServiceManagerClass.getClassLoader(), new Class[]{IServiceManagerClass}, (proxy, method, args) -> {
                 final String methodName = method.getName();
                 if ("addService".equals(methodName) && DELEGATE_SERVICE.equals(args[0])) {
-                    IBinder clipboardService = (IBinder) args[1];
-                    IBinder xServiceManagerService = new XServiceManagerService();
-                    args[1] = new BinderDelegateService(clipboardService, xServiceManagerService);
-                    @SuppressLint("PrivateApi") Class<?> ActivityThreadClass = Class.forName("android.app.ActivityThread");
-                    Method currentActivityThread = ActivityThreadClass.getMethod("currentActivityThread");
-                    Method getSystemContext = ActivityThreadClass.getMethod("getSystemContext");
-                    Context systemContext = (Context) getSystemContext.invoke(currentActivityThread.invoke(null));
-                    for (Map.Entry<String, ServiceFetcher<?>> serviceFetcherEntry : SERVICE_FETCHERS.entrySet()) {
-                        String name = serviceFetcherEntry.getKey();
-                        try {
-                            Binder service = serviceFetcherEntry.getValue().createService(systemContext);
-                            addService(name, service);
-                        } catch (Exception e) {
-                            Log.e(TAG, String.format("create %s service fail", name), e);
+                    try {
+                        IBinder clipboardService = (IBinder) args[1];
+                        IBinder xServiceManagerService = new XServiceManagerService();
+                        args[1] = new BinderDelegateService(clipboardService, xServiceManagerService);
+                        @SuppressLint("PrivateApi") Class<?> ActivityThreadClass = Class.forName("android.app.ActivityThread");
+                        Method currentActivityThread = ActivityThreadClass.getMethod("currentActivityThread");
+                        Method getSystemContext = ActivityThreadClass.getMethod("getSystemContext");
+                        Context systemContext = (Context) getSystemContext.invoke(currentActivityThread.invoke(null));
+                        for (Map.Entry<String, ServiceFetcher<?>> serviceFetcherEntry : SERVICE_FETCHERS.entrySet()) {
+                            String name = serviceFetcherEntry.getKey();
+                            try {
+                                Binder service = serviceFetcherEntry.getValue().createService(systemContext);
+                                addService(name, service);
+                                Log.i(TAG, "[GodModePro] service " + name + " created and added");
+                            } catch (Exception e) {
+                                Log.e(TAG, "[GodModePro] create " + name + " service fail", e);
+                            }
                         }
+                    } catch (Exception e) {
+                        Log.e(TAG, "[GodModePro] addService delegate fail", e);
                     }
                 }
-                return method.invoke(serviceManager, args);
+                try {
+                    return method.invoke(serviceManager, args);
+                } catch (InvocationTargetException e) {
+                    Log.w(TAG, "[GodModePro] proxy call " + methodName + " failed", e.getCause());
+                    throw e.getCause();
+                }
             });
             sServiceManagerField.set(null, serviceManagerDelegate);
             Log.d(TAG, "inject success");
