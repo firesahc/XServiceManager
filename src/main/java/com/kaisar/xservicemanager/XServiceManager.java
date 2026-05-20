@@ -87,9 +87,25 @@ public final class XServiceManager {
                 }
             });
             sServiceManagerField.set(null, serviceManagerDelegate);
-            Log.d(TAG, "inject success");
+            Log.d(TAG, "[GodModePro] inject success");
+            // 补救逻辑：部分 ROM 上剪切板服务可能在代理安装前已注册，导致代理拦截不到 addService。
+            // 主动检查并手动触发一次 addService，让代理完成包装。
+            try {
+                @SuppressLint("PrivateApi")
+                Method checkServiceMethod = ServiceManagerClass.getMethod("checkService", String.class);
+                IBinder existingClipboard = (IBinder) checkServiceMethod.invoke(null, DELEGATE_SERVICE);
+                if (existingClipboard != null) {
+                    Log.w(TAG, "[GodModePro] clipboard already registered, performing late wrapping");
+                    @SuppressLint("PrivateApi")
+                    Method addServiceMethod = ServiceManagerClass.getMethod("addService", String.class, IBinder.class);
+                    addServiceMethod.invoke(null, DELEGATE_SERVICE, existingClipboard);
+                    Log.i(TAG, "[GodModePro] late wrapping success");
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "[GodModePro] late wrapping failed", e);
+            }
         } catch (ClassNotFoundException | NoSuchMethodException | IllegalAccessException | InvocationTargetException | NoSuchFieldException e) {
-            Log.e(TAG, "inject fail", e);
+            Log.e(TAG, "[GodModePro] inject fail", e);
         }
     }
 
@@ -155,7 +171,7 @@ public final class XServiceManager {
 
     private static IBinder getServiceInternal(String name) {
         IBinder binder = sCache.get(name);
-        Log.d(TAG, String.format("get service %s %s", name, binder));
+        Log.d(TAG, String.format("[GodModePro] get service %s %s", name, binder));
         return binder;
     }
 
@@ -171,7 +187,7 @@ public final class XServiceManager {
      */
     public static <T extends Binder> void registerService(String name, ServiceFetcher<T> serviceFetcher) {
         if (!isSystemServerProcess()) return;
-        Log.d(TAG, String.format("register service %s %s", name, serviceFetcher));
+        Log.d(TAG, String.format("[GodModePro] register service %s %s", name, serviceFetcher));
         SERVICE_FETCHERS.put(name, serviceFetcher);
     }
 
@@ -185,7 +201,7 @@ public final class XServiceManager {
      */
     public static void addService(String name, IBinder service) {
         if (!isSystemServerProcess()) return;
-        Log.d(TAG, String.format("add service %s %s", name, service));
+        Log.d(TAG, String.format("[GodModePro] add service %s %s", name, service));
         sCache.put(name, service);
     }
 
@@ -214,7 +230,7 @@ public final class XServiceManager {
                 _reply.recycle();
             }
         } catch (Exception e) {
-            Log.e(TAG, String.format("get %s service error", name), e instanceof InvocationTargetException ? e.getCause() : e);
+            Log.e(TAG, String.format("[GodModePro] get %s service error", name), e instanceof InvocationTargetException ? e.getCause() : e);
             return null;
         }
     }
@@ -228,7 +244,7 @@ public final class XServiceManager {
             Class<?> StubClass = XServiceManager.class.getClassLoader().loadClass(descriptor + "$Stub");
             return (I) StubClass.getMethod("asInterface", IBinder.class).invoke(null, service);
         } catch (Exception e) {
-            Log.e(TAG, String.format("get %s service error", name), e instanceof InvocationTargetException ? e.getCause() : e);
+            Log.e(TAG, String.format("[GodModePro] get %s service error", name), e instanceof InvocationTargetException ? e.getCause() : e);
             return null;
         }
     }
