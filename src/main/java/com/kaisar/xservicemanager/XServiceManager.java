@@ -131,7 +131,8 @@ public final class XServiceManager {
     }
 
     @SuppressLint("PrivateApi")
-    private static IBinder checkService(String name) throws Exception {
+    private static IBinder checkService(String name)
+            throws InvocationTargetException, IllegalAccessException {
         return (IBinder) ServiceManagerReflection.CHECK_SERVICE_METHOD.invoke(null, name);
     }
 
