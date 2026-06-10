@@ -90,6 +90,35 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class XServiceManager {
 
+    // ===================================================================
+    // 日志委托接口 — 允许主项目将日志接入自有日志系统
+    // ===================================================================
+
+    public interface LogDelegate {
+        void d(String tag, String msg);
+        void i(String tag, String msg);
+        void w(String tag, String msg);
+        void w(String tag, String msg, Throwable tr);
+        void e(String tag, String msg, Throwable tr);
+    }
+
+    private static final LogDelegate DEFAULT_DELEGATE = new LogDelegate() {
+        @Override public void d(String tag, String msg) { Log.d(tag, msg); }
+        @Override public void i(String tag, String msg) { Log.i(tag, msg); }
+        @Override public void w(String tag, String msg) { Log.w(tag, msg); }
+        @Override public void w(String tag, String msg, Throwable tr) { Log.w(tag, msg, tr); }
+        @Override public void e(String tag, String msg, Throwable tr) { Log.e(tag, msg, tr); }
+    };
+
+    private static volatile LogDelegate sLog = DEFAULT_DELEGATE;
+
+    /**
+     * 设置日志委托。传入 {@code null} 恢复为默认的 android.util.Log 直调。
+     */
+    public static void setLogDelegate(@Nullable LogDelegate delegate) {
+        sLog = delegate != null ? delegate : DEFAULT_DELEGATE;
+    }
+
     private static final String TAG = "XServiceManager";
     private static final String DELEGATE_SERVICE = "clipboard";
     // NOT thread-safe — only accessed during single-threaded init phase
@@ -160,18 +189,18 @@ public final class XServiceManager {
     public static void initForSystemServer() {
         if (!sInited.compareAndSet(false, true)) return;
         if (!isSystemServerProcess()) {
-            Log.w(TAG, "[GodModePro] initForSystemServer called from non-system_server process");
+            sLog.w(TAG, "initForSystemServer called from non-system_server process");
             return;
         }
         try {
             Object serviceManager = getServiceManagerProxy();
             Object delegate = createClipboardServiceDelegate(serviceManager);
             installServiceManagerDelegate(delegate);
-            Log.d(TAG, "[GodModePro] inject success");
+            sLog.d(TAG, "inject success");
             performLateWrappingIfNeeded();
         } catch (NoSuchMethodException | IllegalAccessException
                  | InvocationTargetException e) {
-            Log.e(TAG, "[GodModePro] inject fail", e);
+            sLog.e(TAG, "inject fail", e);
         }
     }
 
@@ -218,13 +247,13 @@ public final class XServiceManager {
                     Context systemContext = (Context) getSystemContext.invoke(currentActivityThread.invoke(null));
                     initializeRegisteredServices(systemContext);
                 } catch (Exception e) {
-                    Log.e(TAG, "[GodModePro] addService delegate fail", e);
+                    sLog.e(TAG, "addService delegate fail", e);
                 }
             }
             try {
                 return method.invoke(serviceManager, args);
             } catch (InvocationTargetException e) {
-                Log.w(TAG, "[GodModePro] proxy call " + methodName + " failed", e.getCause());
+                sLog.w(TAG, "proxy call " + methodName + " failed", e.getCause());
                 throw e.getCause();
             }
         });
@@ -241,9 +270,9 @@ public final class XServiceManager {
             try {
                 Binder service = serviceFetcherEntry.getValue().createService(ctx);
                 addService(name, service);
-                Log.i(TAG, "[GodModePro] service " + name + " created and added");
+                sLog.i(TAG, "service " + name + " created and added");
             } catch (Exception e) {
-                Log.e(TAG, "[GodModePro] create " + name + " service fail", e);
+                sLog.e(TAG, "create " + name + " service fail", e);
             }
         }
     }
@@ -252,12 +281,12 @@ public final class XServiceManager {
         try {
             IBinder existingClipboard = checkService(DELEGATE_SERVICE);
             if (existingClipboard != null) {
-                Log.w(TAG, "[GodModePro] clipboard already registered, performing late wrapping");
+                sLog.w(TAG, "clipboard already registered, performing late wrapping");
                 addServiceToSM(DELEGATE_SERVICE, existingClipboard);
-                Log.i(TAG, "[GodModePro] late wrapping success");
+                sLog.i(TAG, "late wrapping success");
             }
         } catch (Exception e) {
-            Log.e(TAG, "[GodModePro] late wrapping failed", e);
+            sLog.e(TAG, "late wrapping failed", e);
         }
     }
 
@@ -308,7 +337,7 @@ public final class XServiceManager {
 
     private static IBinder getServiceInternal(String name) {
         IBinder binder = sCache.get(name);
-        Log.d(TAG, String.format("[GodModePro] get service %s %s", name, binder));
+        sLog.d(TAG, String.format("get service %s %s", name, binder));
         return binder;
     }
 
@@ -331,10 +360,10 @@ public final class XServiceManager {
      */
     public static <T extends Binder> void registerService(String name, ServiceFetcher<T> serviceFetcher) {
         if (!isSystemServerProcess()) {
-            Log.w(TAG, String.format("[GodModePro] register service %s ignored — not system_server", name));
+            sLog.w(TAG, String.format("register service %s ignored — not system_server", name));
             return;
         }
-        Log.d(TAG, String.format("[GodModePro] register service %s %s", name, serviceFetcher));
+        sLog.d(TAG, String.format("register service %s %s", name, serviceFetcher));
         SERVICE_FETCHERS.put(name, serviceFetcher);
     }
 
@@ -354,10 +383,10 @@ public final class XServiceManager {
      */
     public static void addService(String name, IBinder service) {
         if (!isSystemServerProcess()) {
-            Log.w(TAG, String.format("[GodModePro] add service %s ignored — not system_server", name));
+            sLog.w(TAG, String.format("add service %s ignored — not system_server", name));
             return;
         }
-        Log.d(TAG, String.format("[GodModePro] add service %s %s", name, service));
+        sLog.d(TAG, String.format("add service %s %s", name, service));
         sCache.put(name, service);
     }
 
@@ -373,7 +402,7 @@ public final class XServiceManager {
         try {
             IBinder delegateService = checkService(DELEGATE_SERVICE);
             if (delegateService == null) {
-                Log.w(TAG, "[GodModePro] cannot access delegate service");
+                sLog.w(TAG, "cannot access delegate service");
                 return null;
             }
             Parcel _data = Parcel.obtain();
@@ -389,7 +418,7 @@ public final class XServiceManager {
                 _reply.recycle();
             }
         } catch (Exception e) {
-            Log.e(TAG, String.format("[GodModePro] get %s service error", name), e instanceof InvocationTargetException ? e.getCause() : e);
+            sLog.e(TAG, String.format("get %s service error", name), e instanceof InvocationTargetException ? e.getCause() : e);
             return null;
         }
     }
@@ -417,7 +446,7 @@ public final class XServiceManager {
             Class<?> StubClass = XServiceManager.class.getClassLoader().loadClass(descriptor + "$Stub");
             return (I) StubClass.getMethod("asInterface", IBinder.class).invoke(null, service);
         } catch (Exception e) {
-            Log.e(TAG, String.format("[GodModePro] get %s service error", name), e instanceof InvocationTargetException ? e.getCause() : e);
+            sLog.e(TAG, String.format("get %s service error", name), e instanceof InvocationTargetException ? e.getCause() : e);
             return null;
         }
     }
