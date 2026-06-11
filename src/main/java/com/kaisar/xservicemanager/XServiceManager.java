@@ -253,8 +253,15 @@ public final class XServiceManager {
             try {
                 return method.invoke(serviceManager, args);
             } catch (InvocationTargetException e) {
-                sLog.w(TAG, "proxy call " + methodName + " failed", e.getCause());
-                throw e.getCause();
+                Throwable cause = e.getCause();
+                // isDeclared 在部分 ROM（MIUI/HyperOS）上因 SELinux 限制会拒绝 Binder 事务，
+                // 安全降级返回 false 而非传播异常，避免调用方类初始化崩溃
+                if ("isDeclared".equals(methodName) && cause instanceof SecurityException) {
+                    sLog.w(TAG, "proxy call " + methodName + " denied by SELinux, returning false");
+                    return Boolean.FALSE;
+                }
+                sLog.w(TAG, "proxy call " + methodName + " failed", cause);
+                throw cause;
             }
         });
     }
