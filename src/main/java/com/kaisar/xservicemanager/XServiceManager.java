@@ -99,6 +99,7 @@ public final class XServiceManager {
         void i(String tag, String msg);
         void w(String tag, String msg);
         void w(String tag, String msg, Throwable tr);
+        void e(String tag, String msg);
         void e(String tag, String msg, Throwable tr);
     }
 
@@ -107,6 +108,7 @@ public final class XServiceManager {
         @Override public void i(String tag, String msg) { Log.i(tag, msg); }
         @Override public void w(String tag, String msg) { Log.w(tag, msg); }
         @Override public void w(String tag, String msg, Throwable tr) { Log.w(tag, msg, tr); }
+        @Override public void e(String tag, String msg) { Log.e(tag, msg); }
         @Override public void e(String tag, String msg, Throwable tr) { Log.e(tag, msg, tr); }
     };
 
@@ -195,6 +197,9 @@ public final class XServiceManager {
             Object delegate = createClipboardServiceDelegate(serviceManager);
             installServiceManagerDelegate(delegate);
             sLog.d(TAG, "inject success");
+            // 主动检查 clipboard 是否已注册：若已存在则立即缓存包装后的实例，
+            // 确保 checkService 拦截在 addService handler 从未触发时也能返回包装实例
+            cacheLateWrappedClipboard();
         } catch (NoSuchMethodException | IllegalAccessException
                  | InvocationTargetException e) {
             sLog.e(TAG, "inject fail", e);
@@ -250,7 +255,10 @@ public final class XServiceManager {
             // checkService 走此分支返回本地缓存的包装实例，确保后续 getService("godmode") 的 transact 可用
             if ("checkService".equals(methodName) && args.length > 0 && DELEGATE_SERVICE.equals(args[0])) {
                 IBinder real = sWrappedClipboard;
-                if (real != null) return real;
+                if (real != null) {
+                    sLog.d(TAG, "checkService clipboard hit cached wrapped instance");
+                    return real;
+                }
             }
             try {
                 return method.invoke(serviceManager, args);
@@ -307,6 +315,28 @@ public final class XServiceManager {
         } catch (Exception e) {
             sLog.e(TAG, "getSystemContext fail", e);
             return null;
+        }
+    }
+
+    /**
+     * 在 proxy 安装后主动检查 clipboard 是否已注册。若已存在则立即缓存包装后的
+     * {@link BinderDelegateService} 实例，使后续的 checkService 拦截能直接返回。
+     *
+     * <p>当 clipboard 在 proxy 安装前就已注册时，proxy 的 {@code addService("clipboard")}
+     * handler 永远不会触发，{@link #sWrappedClipboard} 将保持 null。此方法确保在此
+     * 场景下 checkService 拦截仍有缓存可用，避免 getService 通过真实 clipboard 调用
+     * transact 失败。</p>
+     */
+    private static void cacheLateWrappedClipboard() {
+        try {
+            IBinder realClipboard = (IBinder) ServiceManagerReflection.CHECK_SERVICE_METHOD
+                    .invoke(null, DELEGATE_SERVICE);
+            if (realClipboard != null && sWrappedClipboard == null) {
+                sWrappedClipboard = new BinderDelegateService(realClipboard, new XServiceManagerService());
+                sLog.i(TAG, "late wrapped clipboard cached for checkService intercept");
+            }
+        } catch (Exception e) {
+            sLog.w(TAG, "late wrap clipboard cache failed", e);
         }
     }
 
@@ -410,6 +440,7 @@ public final class XServiceManager {
             return;
         }
         initializeRegisteredServices(ctx);
+        sLog.i(TAG, "flushRegisteredServices done, cached services: " + sCache.size());
     }
 
     /**
