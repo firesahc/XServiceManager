@@ -126,6 +126,10 @@ public final class XServiceManager {
     // NOT thread-safe — only accessed during single-threaded init phase
     private static final Map<String, IBinder> sCache = new HashMap<>();
     private static final AtomicBoolean sInited = new AtomicBoolean(false);
+    /** 缓存被 BinderDelegateService 包装后的 clipboard，用于 addService 被 SELinux 拒绝时
+     *  在 checkService 拦截中返回包装后的 clipboard，确保 getService("godmode") 可用 */
+    @Nullable
+    private static volatile IBinder sWrappedClipboard = null;
 
     private static final String DESCRIPTOR = XServiceManager.class.getName();
     private static final int TRANSACTION_getService = ('_'<<24)|('X'<<16)|('S'<<8)|'M';
@@ -138,14 +142,12 @@ public final class XServiceManager {
     private static final class ServiceManagerReflection {
         static final Class<?> SERVICE_MANAGER_CLASS;
         static final Method CHECK_SERVICE_METHOD;
-        static final Method ADD_SERVICE_METHOD;
         static final Field S_SERVICE_MANAGER_FIELD;
 
         static {
             try {
                 SERVICE_MANAGER_CLASS = Class.forName("android.os.ServiceManager");
                 CHECK_SERVICE_METHOD = SERVICE_MANAGER_CLASS.getMethod("checkService", String.class);
-                ADD_SERVICE_METHOD = SERVICE_MANAGER_CLASS.getMethod("addService", String.class, IBinder.class);
                 S_SERVICE_MANAGER_FIELD = SERVICE_MANAGER_CLASS.getDeclaredField("sServiceManager");
                 S_SERVICE_MANAGER_FIELD.setAccessible(true);
             } catch (ClassNotFoundException | NoSuchMethodException | NoSuchFieldException e) {
@@ -165,11 +167,6 @@ public final class XServiceManager {
         return (IBinder) ServiceManagerReflection.CHECK_SERVICE_METHOD.invoke(null, name);
     }
 
-    @SuppressLint("PrivateApi")
-    private static void addServiceToSM(String name, IBinder service) throws Exception {
-        ServiceManagerReflection.ADD_SERVICE_METHOD.invoke(null, name, service);
-    }
-
     /**
      * Initialize the ServiceManager proxy and install the clipboard service delegate.
      * This is the entry point for the entire framework and must be called
@@ -183,7 +180,8 @@ public final class XServiceManager {
      *   <li>Obtain the IServiceManager proxy via reflection</li>
      *   <li>Create a dynamic proxy wrapper ({@code createClipboardServiceDelegate})</li>
      *   <li>Replace the system's IServiceManager instance ({@code installServiceManagerDelegate})</li>
-     *   <li>Handle late-registered clipboard services ({@code performLateWrappingIfNeeded})</li>
+     *   <li>Clipboard wrapping occurs lazily on first {@code checkService("clipboard")} call
+     *       via the proxy interceptor, bypassing SELinux restrictions on addService</li>
      * </ol>
      */
     public static void initForSystemServer() {
@@ -197,7 +195,9 @@ public final class XServiceManager {
             Object delegate = createClipboardServiceDelegate(serviceManager);
             installServiceManagerDelegate(delegate);
             sLog.d(TAG, "inject success");
-            performLateWrappingIfNeeded();
+            // 主动检查 clipboard 是否已注册：若已存在则立即缓存包装后的实例，
+            // 确保 checkService 拦截在 addService handler 从未触发时也能返回包装实例
+            cacheLateWrappedClipboard();
         } catch (NoSuchMethodException | IllegalAccessException
                  | InvocationTargetException e) {
             sLog.e(TAG, "inject fail", e);
@@ -240,15 +240,20 @@ public final class XServiceManager {
                 try {
                     IBinder clipboardService = (IBinder) args[1];
                     IBinder xServiceManagerService = new XServiceManagerService();
-                    args[1] = new BinderDelegateService(clipboardService, xServiceManagerService);
-                    @SuppressLint("PrivateApi") Class<?> ActivityThreadClass = Class.forName("android.app.ActivityThread");
-                    Method currentActivityThread = ActivityThreadClass.getMethod("currentActivityThread");
-                    Method getSystemContext = ActivityThreadClass.getMethod("getSystemContext");
-                    Context systemContext = (Context) getSystemContext.invoke(currentActivityThread.invoke(null));
-                    initializeRegisteredServices(systemContext);
+                    IBinder wrapped = new BinderDelegateService(clipboardService, xServiceManagerService);
+                    args[1] = wrapped;
+                    sWrappedClipboard = wrapped;
+                    Context ctx = getSystemContext();
+                    if (ctx != null) initializeRegisteredServices(ctx);
                 } catch (Exception e) {
                     sLog.e(TAG, "addService delegate fail", e);
                 }
+            }
+            // 当 addService 被 SELinux 拒绝导致 ServiceManager 内未真正注册包装后的 clipboard 时，
+            // checkService 走此分支返回本地缓存的包装实例，确保后续 getService("godmode") 的 transact 可用
+            if ("checkService".equals(methodName) && args.length > 0 && DELEGATE_SERVICE.equals(args[0])) {
+                IBinder real = sWrappedClipboard;
+                if (real != null) return real;
             }
             try {
                 return method.invoke(serviceManager, args);
@@ -261,6 +266,7 @@ public final class XServiceManager {
                     sLog.w(TAG, "proxy call " + method.getName() + " denied by SELinux,"
                             + " returning safe default for " + retType.getSimpleName());
                     if (retType == boolean.class) return Boolean.FALSE;
+                    if (retType == void.class) return null;
                     if (!retType.isPrimitive()) return null;
                     // int/long 等基本类型不能安全降级，继续传播
                 }
@@ -276,10 +282,15 @@ public final class XServiceManager {
     }
 
     private static void initializeRegisteredServices(Context ctx) {
-        for (Map.Entry<String, ServiceFetcher<?>> serviceFetcherEntry : SERVICE_FETCHERS.entrySet()) {
-            String name = serviceFetcherEntry.getKey();
+        for (Map.Entry<String, ServiceFetcher<?>> entry : SERVICE_FETCHERS.entrySet()) {
+            String name = entry.getKey();
+            // 幂等：跳过已创建的服务
+            if (sCache.containsKey(name)) {
+                sLog.d(TAG, "service " + name + " already exists, skip");
+                continue;
+            }
             try {
-                Binder service = serviceFetcherEntry.getValue().createService(ctx);
+                Binder service = entry.getValue().createService(ctx);
                 addService(name, service);
                 sLog.i(TAG, "service " + name + " created and added");
             } catch (Exception e) {
@@ -288,16 +299,39 @@ public final class XServiceManager {
         }
     }
 
-    private static void performLateWrappingIfNeeded() {
+    @SuppressLint({"PrivateApi", "DiscouragedPrivateApi"})
+    @Nullable
+    private static Context getSystemContext() {
         try {
-            IBinder existingClipboard = checkService(DELEGATE_SERVICE);
-            if (existingClipboard != null) {
-                sLog.w(TAG, "clipboard already registered, performing late wrapping");
-                addServiceToSM(DELEGATE_SERVICE, existingClipboard);
-                sLog.i(TAG, "late wrapping success");
+            Class<?> ActivityThreadClass = Class.forName("android.app.ActivityThread");
+            Method currentActivityThread = ActivityThreadClass.getMethod("currentActivityThread");
+            Method getSystemContext = ActivityThreadClass.getMethod("getSystemContext");
+            return (Context) getSystemContext.invoke(currentActivityThread.invoke(null));
+        } catch (Exception e) {
+            sLog.e(TAG, "getSystemContext fail", e);
+            return null;
+        }
+    }
+
+    /**
+     * 在 proxy 安装后主动检查 clipboard 是否已注册。若已存在则立即缓存包装后的
+     * {@link BinderDelegateService} 实例，使后续的 checkService 拦截能直接返回。
+     *
+     * <p>当 clipboard 在 proxy 安装前就已注册时，proxy 的 {@code addService("clipboard")}
+     * handler 永远不会触发，{@link #sWrappedClipboard} 将保持 null。此方法确保在此
+     * 场景下 checkService 拦截仍有缓存可用，避免 getService 通过真实 clipboard 调用
+     * transact 失败。</p>
+     */
+    private static void cacheLateWrappedClipboard() {
+        try {
+            IBinder realClipboard = (IBinder) ServiceManagerReflection.CHECK_SERVICE_METHOD
+                    .invoke(null, DELEGATE_SERVICE);
+            if (realClipboard != null && sWrappedClipboard == null) {
+                sWrappedClipboard = new BinderDelegateService(realClipboard, new XServiceManagerService());
+                sLog.i(TAG, "late wrapped clipboard cached for checkService intercept");
             }
         } catch (Exception e) {
-            sLog.e(TAG, "late wrapping failed", e);
+            sLog.w(TAG, "late wrap clipboard cache failed", e);
         }
     }
 
@@ -376,6 +410,31 @@ public final class XServiceManager {
         }
         sLog.d(TAG, String.format("register service %s %s", name, serviceFetcher));
         SERVICE_FETCHERS.put(name, serviceFetcher);
+    }
+
+    /**
+     * 立即创建所有已注册的延迟服务（ServiceFetcher）。
+     * 必须在所有 {@link #registerService(String, ServiceFetcher)} 调用完成后调用。
+     *
+     * <p>幂等操作：已存在于 {@code sCache} 中的服务跳过创建。
+     * 通常由 {@code bootstrapSystemService()} 在 init + register 之后主动调用，
+     * 作为 proxy 拦截 {@code addService("clipboard")} 触发创建的补充路径，
+     * 解决 clipboard 已注册导致延迟服务永不创建的竞态问题。</p>
+     *
+     * <p>Must be called from {@code system_server} — calls from other processes
+     * are silently ignored and logged as warnings.</p>
+     */
+    public static void flushRegisteredServices() {
+        if (!isSystemServerProcess()) {
+            sLog.w(TAG, "flushRegisteredServices ignored — not system_server");
+            return;
+        }
+        Context ctx = getSystemContext();
+        if (ctx == null) {
+            sLog.e(TAG, "flushRegisteredServices: cannot get system context");
+            return;
+        }
+        initializeRegisteredServices(ctx);
     }
 
     /**
