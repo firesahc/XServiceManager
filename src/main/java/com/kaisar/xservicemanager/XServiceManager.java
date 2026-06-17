@@ -17,15 +17,16 @@ import androidx.annotation.Nullable;
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedHelpers;
 
 /**
  * System service injection framework that bypasses SELinux restrictions to add
@@ -130,9 +131,6 @@ public final class XServiceManager {
     private static final AtomicBoolean sInited = new AtomicBoolean(false);
     /** 缓存被 BinderDelegateService 包装后的 clipboard，用于 addService 被 SELinux 拒绝时
      *  在 checkService 拦截中返回包装后的 clipboard，确保 getService("godmode") 可用 */
-    @Nullable
-    private static volatile IBinder sWrappedClipboard = null;
-
     private static final String DESCRIPTOR = XServiceManager.class.getName();
     private static final int TRANSACTION_getService = ('_'<<24)|('X'<<16)|('S'<<8)|'M';
 
@@ -144,15 +142,12 @@ public final class XServiceManager {
     private static final class ServiceManagerReflection {
         static final Class<?> SERVICE_MANAGER_CLASS;
         static final Method CHECK_SERVICE_METHOD;
-        static final Field S_SERVICE_MANAGER_FIELD;
 
         static {
             try {
                 SERVICE_MANAGER_CLASS = Class.forName("android.os.ServiceManager");
                 CHECK_SERVICE_METHOD = SERVICE_MANAGER_CLASS.getMethod("checkService", String.class);
-                S_SERVICE_MANAGER_FIELD = SERVICE_MANAGER_CLASS.getDeclaredField("sServiceManager");
-                S_SERVICE_MANAGER_FIELD.setAccessible(true);
-            } catch (ClassNotFoundException | NoSuchMethodException | NoSuchFieldException e) {
+            } catch (ClassNotFoundException | NoSuchMethodException e) {
                 throw new ExceptionInInitializerError(e);
             }
         }
@@ -193,17 +188,34 @@ public final class XServiceManager {
             return;
         }
         try {
-            Object serviceManager = getServiceManagerProxy();
-            Object delegate = createClipboardServiceDelegate(serviceManager);
-            installServiceManagerDelegate(delegate);
-            sLog.d(TAG, "inject success");
-            // 主动检查 clipboard 是否已注册：若已存在则立即缓存包装后的实例，
-            // 确保 checkService 拦截在 addService handler 从未触发时也能返回包装实例
-            cacheLateWrappedClipboard();
-        } catch (NoSuchMethodException | IllegalAccessException
-                 | InvocationTargetException e) {
+            installClipboardTransactionHook();
+            sLog.d(TAG, "clipboard transaction bridge installed");
+        } catch (Throwable e) {
             sLog.e(TAG, "inject fail", e);
         }
+    }
+
+    private static void installClipboardTransactionHook() {
+        Class<?> clipboardStubClass = XposedHelpers.findClass(
+                "android.content.IClipboard$Stub", ClassLoader.getSystemClassLoader());
+        XposedHelpers.findAndHookMethod(clipboardStubClass, "onTransact",
+                int.class, Parcel.class, Parcel.class, int.class, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        int code = (int) param.args[0];
+                        if (code != TRANSACTION_getService) {
+                            return;
+                        }
+                        Parcel data = (Parcel) param.args[1];
+                        Parcel reply = (Parcel) param.args[2];
+                        if (reply == null) {
+                            return;
+                        }
+                        if (handleGetServiceTransaction(data, reply)) {
+                            param.setResult(true);
+                        }
+                    }
+                });
     }
 
     private static boolean isSystemServerProcess() {
@@ -224,16 +236,9 @@ public final class XServiceManager {
     }
 
     @SuppressLint({"PrivateApi", "DiscouragedPrivateApi"})
-    private static Object getServiceManagerProxy()
-            throws NoSuchMethodException, IllegalAccessException, InvocationTargetException {
-        Class<?> serviceManagerClass = getServiceManagerClass();
-        Method getIServiceManagerMethod = serviceManagerClass.getDeclaredMethod("getIServiceManager");
-        getIServiceManagerMethod.setAccessible(true);
-        return getIServiceManagerMethod.invoke(null);
-    }
-
-    @SuppressLint({"PrivateApi", "DiscouragedPrivateApi"})
     private static Object createClipboardServiceDelegate(Object serviceManager) {
+        return serviceManager;
+        /*
         Field sServiceManagerField = ServiceManagerReflection.S_SERVICE_MANAGER_FIELD;
         Class<?> IServiceManagerClass = sServiceManagerField.getType();
         return Proxy.newProxyInstance(IServiceManagerClass.getClassLoader(), new Class[]{IServiceManagerClass}, (proxy, method, args) -> {
@@ -279,11 +284,7 @@ public final class XServiceManager {
                 throw cause;
             }
         });
-    }
-
-    @SuppressLint({"PrivateApi", "DiscouragedPrivateApi"})
-    private static void installServiceManagerDelegate(Object delegate) throws IllegalAccessException {
-        ServiceManagerReflection.S_SERVICE_MANAGER_FIELD.set(null, delegate);
+        */
     }
 
     private static void initializeRegisteredServices(Context ctx) {
@@ -328,16 +329,6 @@ public final class XServiceManager {
      * transact 失败。</p>
      */
     private static void cacheLateWrappedClipboard() {
-        try {
-            IBinder realClipboard = (IBinder) ServiceManagerReflection.CHECK_SERVICE_METHOD
-                    .invoke(null, DELEGATE_SERVICE);
-            if (realClipboard != null && sWrappedClipboard == null) {
-                sWrappedClipboard = new BinderDelegateService(realClipboard, new XServiceManagerService());
-                sLog.i(TAG, "late wrapped clipboard cached for checkService intercept");
-            }
-        } catch (Exception e) {
-            sLog.w(TAG, "late wrap clipboard cache failed", e);
-        }
     }
 
     private static final class BinderDelegateService extends Binder {
@@ -359,6 +350,17 @@ public final class XServiceManager {
         }
     }
 
+    private static boolean handleGetServiceTransaction(@NonNull Parcel data,
+                                                       @NonNull Parcel reply)
+            throws RemoteException {
+        data.enforceInterface(DESCRIPTOR);
+        String name = data.readString();
+        reply.writeNoException();
+        IBinder binder = getServiceInternal(name);
+        reply.writeStrongBinder(binder);
+        return true;
+    }
+
     private static final class XServiceManagerService extends Binder {
 
         @Override
@@ -370,12 +372,7 @@ public final class XServiceManager {
                     return true;
                 }
                 case TRANSACTION_getService: {
-                    data.enforceInterface(descriptor);
-                    String name = data.readString();
-                    reply.writeNoException();
-                    IBinder binder = getServiceInternal(name);
-                    reply.writeStrongBinder(binder);
-                    return true;
+                    return handleGetServiceTransaction(data, reply);
                 }
                 default: {
                     return super.onTransact(code, data, reply, flags);
