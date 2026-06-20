@@ -235,58 +235,6 @@ public final class XServiceManager {
         return false;
     }
 
-    @SuppressLint({"PrivateApi", "DiscouragedPrivateApi"})
-    private static Object createClipboardServiceDelegate(Object serviceManager) {
-        return serviceManager;
-        /*
-        Field sServiceManagerField = ServiceManagerReflection.S_SERVICE_MANAGER_FIELD;
-        Class<?> IServiceManagerClass = sServiceManagerField.getType();
-        return Proxy.newProxyInstance(IServiceManagerClass.getClassLoader(), new Class[]{IServiceManagerClass}, (proxy, method, args) -> {
-            final String methodName = method.getName();
-            if ("addService".equals(methodName) && DELEGATE_SERVICE.equals(args[0])) {
-                try {
-                    IBinder clipboardService = (IBinder) args[1];
-                    IBinder xServiceManagerService = new XServiceManagerService();
-                    IBinder wrapped = new BinderDelegateService(clipboardService, xServiceManagerService);
-                    args[1] = wrapped;
-                    sWrappedClipboard = wrapped;
-                    Context ctx = getSystemContext();
-                    if (ctx != null) initializeRegisteredServices(ctx);
-                } catch (Exception e) {
-                    sLog.e(TAG, "addService delegate fail", e);
-                }
-            }
-            // 当 addService 被 SELinux 拒绝导致 ServiceManager 内未真正注册包装后的 clipboard 时，
-            // checkService 走此分支返回本地缓存的包装实例，确保后续 getService("godmode") 的 transact 可用
-            if ("checkService".equals(methodName) && args.length > 0 && DELEGATE_SERVICE.equals(args[0])) {
-                IBinder real = sWrappedClipboard;
-                if (real != null) {
-                    sLog.d(TAG, "checkService clipboard hit cached wrapped instance");
-                    return real;
-                }
-            }
-            try {
-                return method.invoke(serviceManager, args);
-            } catch (InvocationTargetException e) {
-                Throwable cause = e.getCause();
-                // 部分 ROM（MIUI/HyperOS）的 SELinux 策略会拒绝某些 IServiceManager 的 Binder 事务，
-                // 对 SecurityException 按返回类型安全降级，避免异常传播导致调用方类初始化崩溃
-                if (cause instanceof SecurityException) {
-                    Class<?> retType = method.getReturnType();
-                    sLog.w(TAG, "proxy call " + method.getName() + " denied by SELinux,"
-                            + " returning safe default for " + retType.getSimpleName());
-                    if (retType == boolean.class) return Boolean.FALSE;
-                    if (retType == void.class) return null;
-                    if (!retType.isPrimitive()) return null;
-                    // int/long 等基本类型不能安全降级，继续传播
-                }
-                sLog.w(TAG, "proxy call " + method.getName() + " failed", cause);
-                throw cause;
-            }
-        });
-        */
-    }
-
     private static void initializeRegisteredServices(Context ctx) {
         for (Map.Entry<String, ServiceFetcher<?>> entry : SERVICE_FETCHERS.entrySet()) {
             String name = entry.getKey();
@@ -316,37 +264,6 @@ public final class XServiceManager {
         } catch (Exception e) {
             sLog.e(TAG, "getSystemContext fail", e);
             return null;
-        }
-    }
-
-    /**
-     * 在 proxy 安装后主动检查 clipboard 是否已注册。若已存在则立即缓存包装后的
-     * {@link BinderDelegateService} 实例，使后续的 checkService 拦截能直接返回。
-     *
-     * <p>当 clipboard 在 proxy 安装前就已注册时，proxy 的 {@code addService("clipboard")}
-     * handler 永远不会触发，{@link #sWrappedClipboard} 将保持 null。此方法确保在此
-     * 场景下 checkService 拦截仍有缓存可用，避免 getService 通过真实 clipboard 调用
-     * transact 失败。</p>
-     */
-    private static void cacheLateWrappedClipboard() {
-    }
-
-    private static final class BinderDelegateService extends Binder {
-
-        private final IBinder systemService;
-        private final IBinder customService;
-
-        public BinderDelegateService(IBinder systemService, IBinder customService) {
-            this.systemService = systemService;
-            this.customService = customService;
-        }
-
-        @Override
-        protected boolean onTransact(int code, @NonNull Parcel data, @Nullable Parcel reply, int flags) throws RemoteException {
-            if(code == TRANSACTION_getService){
-                return customService.transact(code, data, reply, flags);
-            }
-            return systemService.transact(code, data, reply, flags);
         }
     }
 

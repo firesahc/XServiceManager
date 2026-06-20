@@ -28,5 +28,5 @@ android {
 
 dependencies {
     implementation libs.androidx.annotation
-    compileOnly files("${rootProject.projectDir}/app/src/main/lib/xposed-api-89.jar")
+    compileOnly files("${rootProject.projectDir}/libs/xposed-api-89.jar")
 }
