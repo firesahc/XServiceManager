@@ -33,24 +33,24 @@ import de.robv.android.xposed.XposedHelpers;
  * custom services accessible via IPC from user applications.
  *
  * <h3>Architecture</h3>
- * <p>XServiceManager operates by intercepting the {@code addService("clipboard", ...)} call
- * within the {@link android.os.ServiceManager} using a dynamic proxy. When {@code initForSystemServer()}
- * is called, it replaces the system's IServiceManager instance with a proxy that wraps
- * the clipboard service's {@link IBinder} in a {@link BinderDelegateService}, routing custom
- * service calls through an {@code XServiceManagerService} handler.</p>
+ * <p>XServiceManager operates by installing an Xposed hook on
+ * {@code android.content.IClipboard.Stub#onTransact} inside {@code system_server}.
+ * The original clipboard service remains in place. Calls using XServiceManager's
+ * private transaction code are handled by this class and routed to custom Binder services
+ * stored in an in-memory registry.</p>
  *
  * <h3>Workflow</h3>
  * <ol>
- *   <li>{@link #initForSystemServer()} creates a {@link java.lang.reflect.Proxy} on IServiceManager</li>
- *   <li>The proxy intercepts {@code addService("clipboard")} and wraps the clipboard IBinder
- *       with a {@code BinderDelegateService} that delegates custom service transactions
- *       (identified by a magic transaction code) to the {@code XServiceManagerService}</li>
+ *   <li>{@link #initForSystemServer()} hooks {@code IClipboard.Stub#onTransact}</li>
+ *   <li>The hook handles only XServiceManager's private transaction code and leaves normal
+ *       clipboard transactions untouched</li>
  *   <li>Services registered via {@link #registerService(String, ServiceFetcher)} are
- *       lazily created when the clipboard service is first added</li>
+ *       created when {@link #flushRegisteredServices()} runs, or immediately when registered
+ *       after a previous flush</li>
  *   <li>Services added via {@link #addService(String, IBinder)} are stored immediately
  *       in the internal cache and made available for IPC retrieval</li>
  *   <li>User applications retrieve custom services via {@link #getService(String)}
- *       or {@link #getServiceInterface(String)} by accessing the wrapped clipboard service</li>
+ *       or {@link #getServiceInterface(String)} by sending a private transaction to clipboard</li>
  * </ol>
  *
  * <h3>Constraints</h3>
@@ -58,11 +58,10 @@ import de.robv.android.xposed.XposedHelpers;
  *   <li><b>Process:</b> All public methods must be called from the {@code system_server} process.
  *       Calling from any other process (including system apps) will be silently rejected.</li>
  *   <li><b>Initialization:</b> {@link #initForSystemServer()} must be called before any other
- *       public method, and should only be invoked once (repeated calls are ignored via an
- *       internal {@link java.util.concurrent.atomic.AtomicBoolean} guard).</li>
- *   <li><b>Thread safety:</b> This class is NOT thread-safe. All initialization and service
- *       registration should occur during the single-threaded startup phase of system_server.
- *       The internal maps ({@code SERVICE_FETCHERS}, {@code sCache}) are not synchronized.</li>
+ *       public method. Failed initialization is retryable; successful initialization is guarded
+ *       by an internal {@link java.util.concurrent.atomic.AtomicBoolean}.</li>
+ *   <li><b>Thread safety:</b> Service registration and cache access are synchronized so late
+ *       registration and diagnostics can run safely after startup.</li>
  *   <li><b>SELinux:</b> Custom services run in the {@code system} user group within the
  *       {@code system_server} process and are subject to standard SELinux restrictions.
  *       Data storage is limited to paths accessible to the system user (e.g., {@code /data/system}).</li>
@@ -80,14 +79,13 @@ import de.robv.android.xposed.XposedHelpers;
  *   <tr>
  *     <td>Deferred</td>
  *     <td>{@link #registerService(String, ServiceFetcher)}</td>
- *     <td>Created lazily when clipboard service is first added</td>
+ *     <td>Created on flush, or immediately after a previous flush</td>
  *     <td>Services requiring {@link Context} or dependent on system services</td>
  *   </tr>
  * </table>
  *
  * @see android.os.ServiceManager
  * @see android.app.ActivityThread
- * @see java.lang.reflect.Proxy
  */
 public final class XServiceManager {
 
@@ -124,15 +122,43 @@ public final class XServiceManager {
 
     private static final String TAG = "XServiceManager";
     private static final String DELEGATE_SERVICE = "clipboard";
-    // NOT thread-safe — only accessed during single-threaded init phase
     private static final Map<String, ServiceFetcher<? extends Binder>> SERVICE_FETCHERS = new ArrayMap<>();
-    // NOT thread-safe — only accessed during single-threaded init phase
     private static final Map<String, IBinder> sCache = new HashMap<>();
+    private static final Object sLock = new Object();
     private static final AtomicBoolean sInited = new AtomicBoolean(false);
-    /** 缓存被 BinderDelegateService 包装后的 clipboard，用于 addService 被 SELinux 拒绝时
-     *  在 checkService 拦截中返回包装后的 clipboard，确保 getService("godmode") 可用 */
+    private static volatile boolean sFlushed;
+    private static volatile String sLastError;
+    /** 通过 clipboard Binder 私有事务承载自定义服务查询，避免直接 addService 触发 SELinux 限制。 */
     private static final String DESCRIPTOR = XServiceManager.class.getName();
+    private static final int TRANSACTION_ping = ('_'<<24)|('X'<<16)|('P'<<8)|'G';
     private static final int TRANSACTION_getService = ('_'<<24)|('X'<<16)|('S'<<8)|'M';
+    private static final int TRANSACTION_getStatus = ('_'<<24)|('X'<<16)|('S'<<8)|'T';
+
+    public static final class BridgeStatus {
+        public final boolean bridgeInstalled;
+        public final boolean systemServer;
+        public final int registeredServiceCount;
+        @Nullable public final String lastError;
+
+        private BridgeStatus(boolean bridgeInstalled, boolean systemServer,
+                             int registeredServiceCount, @Nullable String lastError) {
+            this.bridgeInstalled = bridgeInstalled;
+            this.systemServer = systemServer;
+            this.registeredServiceCount = registeredServiceCount;
+            this.lastError = lastError;
+        }
+
+        @NonNull
+        @Override
+        public String toString() {
+            return "BridgeStatus{"
+                    + "bridgeInstalled=" + bridgeInstalled
+                    + ", systemServer=" + systemServer
+                    + ", registeredServiceCount=" + registeredServiceCount
+                    + ", lastError='" + lastError + '\''
+                    + '}';
+        }
+    }
 
     public interface ServiceFetcher<T extends Binder> {
         T createService(Context ctx);
@@ -165,34 +191,54 @@ public final class XServiceManager {
     }
 
     /**
-     * Initialize the ServiceManager proxy and install the clipboard service delegate.
+     * Install a private transaction bridge on {@code IClipboard.Stub#onTransact}.
      * This is the entry point for the entire framework and must be called
      * from the {@code system_server} process during Xposed module initialization.
      *
      * <p>Safe to call multiple times — subsequent calls are no-ops after the first
      * successful initialization.</p>
-     *
-     * <p>Internal workflow:
-     * <ol>
-     *   <li>Obtain the IServiceManager proxy via reflection</li>
-     *   <li>Create a dynamic proxy wrapper ({@code createClipboardServiceDelegate})</li>
-     *   <li>Replace the system's IServiceManager instance ({@code installServiceManagerDelegate})</li>
-     *   <li>Clipboard wrapping occurs lazily on first {@code checkService("clipboard")} call
-     *       via the proxy interceptor, bypassing SELinux restrictions on addService</li>
-     * </ol>
      */
-    public static void initForSystemServer() {
-        if (!sInited.compareAndSet(false, true)) return;
+    public static boolean initForSystemServer() {
+        if (sInited.get()) return true;
         if (!isSystemServerProcess()) {
-            sLog.w(TAG, "initForSystemServer called from non-system_server process");
-            return;
+            setLastError("initForSystemServer called from non-system_server process");
+            sLog.w(TAG, sLastError);
+            return false;
         }
         try {
             installClipboardTransactionHook();
+            sInited.set(true);
+            sLastError = null;
             sLog.d(TAG, "clipboard transaction bridge installed");
+            return true;
         } catch (Throwable e) {
+            setLastError("install clipboard transaction bridge failed: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
             sLog.e(TAG, "inject fail", e);
+            return false;
         }
+    }
+
+    public static boolean isBridgeInstalled() {
+        return sInited.get();
+    }
+
+    @NonNull
+    public static BridgeStatus getBridgeStatus() {
+        int serviceCount;
+        synchronized (sLock) {
+            serviceCount = sCache.size();
+        }
+        return new BridgeStatus(sInited.get(), isSystemServerProcess(), serviceCount, sLastError);
+    }
+
+    @Nullable
+    public static String getLastError() {
+        return sLastError;
+    }
+
+    private static void setLastError(String error) {
+        sLastError = error;
     }
 
     private static void installClipboardTransactionHook() {
@@ -203,7 +249,9 @@ public final class XServiceManager {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                         int code = (int) param.args[0];
-                        if (code != TRANSACTION_getService) {
+                        if (code != TRANSACTION_ping
+                                && code != TRANSACTION_getService
+                                && code != TRANSACTION_getStatus) {
                             return;
                         }
                         Parcel data = (Parcel) param.args[1];
@@ -211,7 +259,30 @@ public final class XServiceManager {
                         if (reply == null) {
                             return;
                         }
-                        if (handleGetServiceTransaction(data, reply)) {
+                        try {
+                            switch (code) {
+                                case TRANSACTION_ping:
+                                    if (handlePingTransaction(data, reply)) {
+                                        param.setResult(true);
+                                    }
+                                    break;
+                                case TRANSACTION_getService:
+                                    if (handleGetServiceTransaction(data, reply)) {
+                                        param.setResult(true);
+                                    }
+                                    break;
+                                case TRANSACTION_getStatus:
+                                    if (handleGetStatusTransaction(data, reply)) {
+                                        param.setResult(true);
+                                    }
+                                    break;
+                            }
+                        } catch (Throwable t) {
+                            setLastError("handle private clipboard transaction failed: "
+                                    + t.getClass().getSimpleName() + ": " + t.getMessage());
+                            sLog.e(TAG, sLastError, t);
+                            reply.writeException(t instanceof Exception
+                                    ? (Exception) t : new RemoteException(t.getMessage()));
                             param.setResult(true);
                         }
                     }
@@ -236,12 +307,18 @@ public final class XServiceManager {
     }
 
     private static void initializeRegisteredServices(Context ctx) {
-        for (Map.Entry<String, ServiceFetcher<?>> entry : SERVICE_FETCHERS.entrySet()) {
+        Map<String, ServiceFetcher<? extends Binder>> fetchers;
+        synchronized (sLock) {
+            fetchers = new HashMap<>(SERVICE_FETCHERS);
+        }
+        for (Map.Entry<String, ServiceFetcher<? extends Binder>> entry : fetchers.entrySet()) {
             String name = entry.getKey();
             // 幂等：跳过已创建的服务
-            if (sCache.containsKey(name)) {
-                sLog.d(TAG, "service " + name + " already exists, skip");
-                continue;
+            synchronized (sLock) {
+                if (sCache.containsKey(name)) {
+                    sLog.d(TAG, "service " + name + " already exists, skip");
+                    continue;
+                }
             }
             try {
                 Binder service = entry.getValue().createService(ctx);
@@ -278,38 +355,55 @@ public final class XServiceManager {
         return true;
     }
 
-    private static final class XServiceManagerService extends Binder {
+    private static boolean handlePingTransaction(@NonNull Parcel data,
+                                                 @NonNull Parcel reply)
+            throws RemoteException {
+        data.enforceInterface(DESCRIPTOR);
+        reply.writeNoException();
+        reply.writeInt(1);
+        return true;
+    }
 
-        @Override
-        protected boolean onTransact(int code, @NonNull Parcel data, Parcel reply, int flags) throws RemoteException {
-            String descriptor = DESCRIPTOR;
-            switch (code) {
-                case INTERFACE_TRANSACTION: {
-                    reply.writeString(descriptor);
-                    return true;
-                }
-                case TRANSACTION_getService: {
-                    return handleGetServiceTransaction(data, reply);
-                }
-                default: {
-                    return super.onTransact(code, data, reply, flags);
-                }
-            }
-        }
-
+    private static boolean handleGetStatusTransaction(@NonNull Parcel data,
+                                                      @NonNull Parcel reply)
+            throws RemoteException {
+        data.enforceInterface(DESCRIPTOR);
+        writeBridgeStatus(reply, getBridgeStatus());
+        return true;
     }
 
     private static IBinder getServiceInternal(String name) {
-        IBinder binder = sCache.get(name);
+        IBinder binder;
+        synchronized (sLock) {
+            binder = sCache.get(name);
+        }
         sLog.d(TAG, String.format("get service %s %s", name, binder));
         return binder;
     }
 
+    private static void writeBridgeStatus(@NonNull Parcel reply, @NonNull BridgeStatus status) {
+        reply.writeNoException();
+        reply.writeInt(status.bridgeInstalled ? 1 : 0);
+        reply.writeInt(status.systemServer ? 1 : 0);
+        reply.writeInt(status.registeredServiceCount);
+        reply.writeString(status.lastError);
+    }
+
+    @NonNull
+    private static BridgeStatus readBridgeStatus(@NonNull Parcel reply) {
+        boolean bridgeInstalled = reply.readInt() != 0;
+        boolean systemServer = reply.readInt() != 0;
+        int serviceCount = reply.readInt();
+        String lastError = reply.readString();
+        return new BridgeStatus(bridgeInstalled, systemServer, serviceCount, lastError);
+    }
+
     /**
      * Register a service factory for deferred (lazy) creation.
-     * The service is not created immediately; it will be instantiated via the
-     * {@link ServiceFetcher#createService(Context)} callback when the clipboard
-     * service is first intercepted by the proxy.
+     * The service is not created immediately before the first flush; it will be
+     * instantiated via the {@link ServiceFetcher#createService(Context)} callback
+     * when {@link #flushRegisteredServices()} runs. After a previous flush, late
+     * registrations are created immediately.
      *
      * <p>Use this method when your service needs a system {@link Context} or
      * depends on core system services that are not yet available at registration time.
@@ -328,7 +422,27 @@ public final class XServiceManager {
             return;
         }
         sLog.d(TAG, String.format("register service %s %s", name, serviceFetcher));
-        SERVICE_FETCHERS.put(name, serviceFetcher);
+        boolean shouldCreateNow;
+        synchronized (sLock) {
+            SERVICE_FETCHERS.put(name, serviceFetcher);
+            shouldCreateNow = sFlushed && !sCache.containsKey(name);
+        }
+        if (shouldCreateNow) {
+            Context ctx = getSystemContext();
+            if (ctx == null) {
+                setLastError("registerService: cannot get system context for " + name);
+                sLog.e(TAG, sLastError);
+                return;
+            }
+            try {
+                addService(name, serviceFetcher.createService(ctx));
+                sLog.i(TAG, "service " + name + " created after late registration");
+            } catch (Exception e) {
+                setLastError("create " + name + " service after late registration failed: "
+                        + e.getClass().getSimpleName() + ": " + e.getMessage());
+                sLog.e(TAG, sLastError, e);
+            }
+        }
     }
 
     /**
@@ -337,8 +451,7 @@ public final class XServiceManager {
      *
      * <p>幂等操作：已存在于 {@code sCache} 中的服务跳过创建。
      * 通常由 {@code bootstrapSystemService()} 在 init + register 之后主动调用，
-     * 作为 proxy 拦截 {@code addService("clipboard")} 触发创建的补充路径，
-     * 解决 clipboard 已注册导致延迟服务永不创建的竞态问题。</p>
+     * 作为主动创建路径，解决仅依赖系统服务时序导致延迟服务永不创建的竞态问题。</p>
      *
      * <p>Must be called from {@code system_server} — calls from other processes
      * are silently ignored and logged as warnings.</p>
@@ -354,7 +467,12 @@ public final class XServiceManager {
             return;
         }
         initializeRegisteredServices(ctx);
-        sLog.i(TAG, "flushRegisteredServices done, cached services: " + sCache.size());
+        int serviceCount;
+        synchronized (sLock) {
+            sFlushed = true;
+            serviceCount = sCache.size();
+        }
+        sLog.i(TAG, "flushRegisteredServices done, cached services: " + serviceCount);
     }
 
     /**
@@ -377,7 +495,82 @@ public final class XServiceManager {
             return;
         }
         sLog.d(TAG, String.format("add service %s %s", name, service));
-        sCache.put(name, service);
+        synchronized (sLock) {
+            sCache.put(name, service);
+        }
+    }
+
+    public static boolean pingBridge() {
+        try {
+            IBinder delegateService = checkService(DELEGATE_SERVICE);
+            if (delegateService == null) {
+                setLastError("cannot access delegate service: clipboard is null");
+                sLog.w(TAG, sLastError);
+                return false;
+            }
+            Parcel _data = Parcel.obtain();
+            Parcel _reply = Parcel.obtain();
+            try {
+                _data.writeInterfaceToken(DESCRIPTOR);
+                if (!delegateService.transact(TRANSACTION_ping, _data, _reply, 0)) {
+                    setLastError("clipboard bridge did not handle XServiceManager ping");
+                    sLog.w(TAG, sLastError);
+                    return false;
+                }
+                _reply.readException();
+                boolean ok = _reply.readInt() == 1;
+                if (ok) {
+                    sLastError = null;
+                } else {
+                    setLastError("clipboard bridge ping returned false");
+                }
+                return ok;
+            } finally {
+                _data.recycle();
+                _reply.recycle();
+            }
+        } catch (Exception e) {
+            Throwable cause = e instanceof InvocationTargetException ? e.getCause() : e;
+            setLastError("ping bridge error: " + cause.getClass().getSimpleName()
+                    + ": " + cause.getMessage());
+            sLog.e(TAG, "ping bridge error", cause);
+            return false;
+        }
+    }
+
+    @Nullable
+    public static BridgeStatus getRemoteBridgeStatus() {
+        try {
+            IBinder delegateService = checkService(DELEGATE_SERVICE);
+            if (delegateService == null) {
+                setLastError("cannot access delegate service: clipboard is null");
+                sLog.w(TAG, sLastError);
+                return null;
+            }
+            Parcel _data = Parcel.obtain();
+            Parcel _reply = Parcel.obtain();
+            try {
+                _data.writeInterfaceToken(DESCRIPTOR);
+                if (!delegateService.transact(TRANSACTION_getStatus, _data, _reply, 0)) {
+                    setLastError("clipboard bridge did not handle XServiceManager status");
+                    sLog.w(TAG, sLastError);
+                    return null;
+                }
+                _reply.readException();
+                BridgeStatus status = readBridgeStatus(_reply);
+                sLastError = status.lastError;
+                return status;
+            } finally {
+                _data.recycle();
+                _reply.recycle();
+            }
+        } catch (Exception e) {
+            Throwable cause = e instanceof InvocationTargetException ? e.getCause() : e;
+            setLastError("get bridge status error: " + cause.getClass().getSimpleName()
+                    + ": " + cause.getMessage());
+            sLog.e(TAG, "get bridge status error", cause);
+            return null;
+        }
     }
 
     /**
@@ -392,7 +585,8 @@ public final class XServiceManager {
         try {
             IBinder delegateService = checkService(DELEGATE_SERVICE);
             if (delegateService == null) {
-                sLog.w(TAG, "cannot access delegate service");
+                setLastError("cannot access delegate service: clipboard is null");
+                sLog.w(TAG, sLastError);
                 return null;
             }
             Parcel _data = Parcel.obtain();
@@ -400,15 +594,28 @@ public final class XServiceManager {
             try {
                 _data.writeInterfaceToken(DESCRIPTOR);
                 _data.writeString(name);
-                delegateService.transact(TRANSACTION_getService, _data, _reply, 0);
+                if (!delegateService.transact(TRANSACTION_getService, _data, _reply, 0)) {
+                    setLastError("clipboard bridge did not handle XServiceManager transaction");
+                    sLog.w(TAG, sLastError);
+                    return null;
+                }
                 _reply.readException();
-                return _reply.readStrongBinder();
+                IBinder binder = _reply.readStrongBinder();
+                if (binder == null) {
+                    setLastError(String.format("service %s is not registered in XServiceManager", name));
+                } else {
+                    sLastError = null;
+                }
+                return binder;
             } finally {
                 _data.recycle();
                 _reply.recycle();
             }
         } catch (Exception e) {
-            sLog.e(TAG, String.format("get %s service error", name), e instanceof InvocationTargetException ? e.getCause() : e);
+            Throwable cause = e instanceof InvocationTargetException ? e.getCause() : e;
+            setLastError(String.format("get %s service error: %s: %s",
+                    name, cause.getClass().getSimpleName(), cause.getMessage()));
+            sLog.e(TAG, String.format("get %s service error", name), cause);
             return null;
         }
     }
