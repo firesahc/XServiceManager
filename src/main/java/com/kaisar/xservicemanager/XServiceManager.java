@@ -301,7 +301,7 @@ public final class XServiceManager {
                 return "system_server".equals(processName);
             }
         } catch (IOException ignored) {
-            // Process not found or inaccessible — not system_server
+            sLog.d(TAG, "Process not found or inaccessible — not system_server");
         }
         return false;
     }
