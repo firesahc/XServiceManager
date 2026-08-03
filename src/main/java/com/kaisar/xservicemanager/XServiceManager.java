@@ -164,6 +164,30 @@ public final class XServiceManager {
         T createService(Context ctx);
     }
 
+    public enum AddServiceResult {
+        ADDED,
+        ALREADY_REGISTERED,
+        REPLACED_DEAD,
+        REJECTED_LIVE_CONFLICT,
+        INVALID_REQUEST,
+        NOT_SYSTEM_SERVER
+    }
+
+    public static final class FlushResult {
+        public final boolean complete;
+        public final int registeredServiceCount;
+        public final int expectedServiceCount;
+        @Nullable public final String error;
+
+        private FlushResult(boolean complete, int registeredServiceCount,
+                int expectedServiceCount, @Nullable String error) {
+            this.complete = complete;
+            this.registeredServiceCount = registeredServiceCount;
+            this.expectedServiceCount = expectedServiceCount;
+            this.error = error;
+        }
+    }
+
     @SuppressLint("PrivateApi")
     private static final class ServiceManagerReflection {
         static final Class<?> SERVICE_MANAGER_CLASS;
@@ -306,28 +330,42 @@ public final class XServiceManager {
         return false;
     }
 
-    private static void initializeRegisteredServices(Context ctx) {
+    private static boolean initializeRegisteredServices(Context ctx) {
         Map<String, ServiceFetcher<? extends Binder>> fetchers;
         synchronized (sLock) {
             fetchers = new HashMap<>(SERVICE_FETCHERS);
         }
+        boolean complete = true;
         for (Map.Entry<String, ServiceFetcher<? extends Binder>> entry : fetchers.entrySet()) {
             String name = entry.getKey();
             // 幂等：跳过已创建的服务
             synchronized (sLock) {
-                if (sCache.containsKey(name)) {
+                IBinder existing = sCache.get(name);
+                if (existing != null && existing.isBinderAlive()) {
                     sLog.d(TAG, "service " + name + " already exists, skip");
                     continue;
                 }
             }
             try {
                 Binder service = entry.getValue().createService(ctx);
-                addService(name, service);
-                sLog.i(TAG, "service " + name + " created and added");
+                AddServiceResult result = addService(name, service);
+                if (result == AddServiceResult.ADDED
+                        || result == AddServiceResult.REPLACED_DEAD
+                        || result == AddServiceResult.ALREADY_REGISTERED) {
+                    sLog.i(TAG, "service " + name + " created and added");
+                } else {
+                    complete = false;
+                    setLastError("cannot publish service " + name + ": " + result);
+                    sLog.e(TAG, sLastError);
+                }
             } catch (Exception e) {
+                complete = false;
+                setLastError("create " + name + " service failed: "
+                        + e.getClass().getSimpleName() + ": " + e.getMessage());
                 sLog.e(TAG, "create " + name + " service fail", e);
             }
         }
+        return complete;
     }
 
     @SuppressLint({"PrivateApi", "DiscouragedPrivateApi"})
@@ -424,8 +462,16 @@ public final class XServiceManager {
         sLog.d(TAG, String.format("register service %s %s", name, serviceFetcher));
         boolean shouldCreateNow;
         synchronized (sLock) {
+            IBinder existing = sCache.get(name);
+            if (sFlushed && existing != null && existing.isBinderAlive()) {
+                setLastError("late registration refused to replace live service "
+                        + name);
+                sLog.e(TAG, sLastError);
+                return;
+            }
             SERVICE_FETCHERS.put(name, serviceFetcher);
-            shouldCreateNow = sFlushed && !sCache.containsKey(name);
+            shouldCreateNow = sFlushed && (existing == null
+                    || !existing.isBinderAlive());
         }
         if (shouldCreateNow) {
             Context ctx = getSystemContext();
@@ -435,8 +481,18 @@ public final class XServiceManager {
                 return;
             }
             try {
-                addService(name, serviceFetcher.createService(ctx));
-                sLog.i(TAG, "service " + name + " created after late registration");
+                AddServiceResult result = addService(name,
+                        serviceFetcher.createService(ctx));
+                if (result == AddServiceResult.ADDED
+                        || result == AddServiceResult.REPLACED_DEAD
+                        || result == AddServiceResult.ALREADY_REGISTERED) {
+                    sLog.i(TAG, "service " + name
+                            + " created after late registration");
+                } else {
+                    setLastError("late registration rejected for " + name
+                            + ": " + result);
+                    sLog.e(TAG, sLastError);
+                }
             } catch (Exception e) {
                 setLastError("create " + name + " service after late registration failed: "
                         + e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -456,23 +512,45 @@ public final class XServiceManager {
      * <p>Must be called from {@code system_server} — calls from other processes
      * are silently ignored and logged as warnings.</p>
      */
-    public static void flushRegisteredServices() {
+    public static FlushResult flushRegisteredServices() {
         if (!isSystemServerProcess()) {
             sLog.w(TAG, "flushRegisteredServices ignored — not system_server");
-            return;
+            return new FlushResult(false, 0, 0, "not system_server");
         }
         Context ctx = getSystemContext();
         if (ctx == null) {
-            sLog.e(TAG, "flushRegisteredServices: cannot get system context");
-            return;
+            setLastError("flushRegisteredServices: cannot get system context");
+            sLog.e(TAG, sLastError);
+            return new FlushResult(false, 0, SERVICE_FETCHERS.size(), sLastError);
         }
-        initializeRegisteredServices(ctx);
+        boolean initialized = initializeRegisteredServices(ctx);
         int serviceCount;
+        int expectedCount;
+        boolean complete;
         synchronized (sLock) {
-            sFlushed = true;
             serviceCount = sCache.size();
+            expectedCount = SERVICE_FETCHERS.size();
+            complete = initialized;
+            for (String name : SERVICE_FETCHERS.keySet()) {
+                IBinder binder = sCache.get(name);
+                if (binder == null || !binder.isBinderAlive()) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (complete) sFlushed = true;
         }
-        sLog.i(TAG, "flushRegisteredServices done, cached services: " + serviceCount);
+        if (!complete && sLastError == null) {
+            setLastError("flushRegisteredServices did not publish every service");
+        }
+        if (complete) {
+            sLastError = null;
+            sLog.i(TAG, "flushRegisteredServices done, cached services: " + serviceCount);
+        } else {
+            sLog.e(TAG, sLastError);
+        }
+        return new FlushResult(complete, serviceCount, expectedCount,
+                complete ? null : sLastError);
     }
 
     /**
@@ -489,14 +567,41 @@ public final class XServiceManager {
      * @param name    the name of the new service (used as lookup key)
      * @param service the service object to register
      */
-    public static void addService(String name, IBinder service) {
+    public static AddServiceResult addService(String name, IBinder service) {
         if (!isSystemServerProcess()) {
             sLog.w(TAG, String.format("add service %s ignored — not system_server", name));
-            return;
+            return AddServiceResult.NOT_SYSTEM_SERVER;
+        }
+        if (name == null || name.trim().isEmpty() || service == null) {
+            setLastError("addService received an invalid name or Binder");
+            return AddServiceResult.INVALID_REQUEST;
         }
         sLog.d(TAG, String.format("add service %s %s", name, service));
+        AddServiceResult result;
         synchronized (sLock) {
+            IBinder existing = sCache.get(name);
+            if (existing == service) return AddServiceResult.ALREADY_REGISTERED;
+            if (existing != null && existing.isBinderAlive()) {
+                setLastError("refusing to replace live service " + name);
+                return AddServiceResult.REJECTED_LIVE_CONFLICT;
+            }
+            result = existing == null ? AddServiceResult.ADDED
+                    : AddServiceResult.REPLACED_DEAD;
             sCache.put(name, service);
+        }
+        try {
+            service.linkToDeath(() -> removeDeadService(name, service), 0);
+        } catch (RemoteException dead) {
+            removeDeadService(name, service);
+            setLastError("service " + name + " died during registration");
+            return AddServiceResult.INVALID_REQUEST;
+        }
+        return result;
+    }
+
+    private static void removeDeadService(String name, IBinder service) {
+        synchronized (sLock) {
+            if (sCache.get(name) == service) sCache.remove(name);
         }
     }
 
