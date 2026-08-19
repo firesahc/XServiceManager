@@ -415,7 +415,6 @@ public final class XServiceManager {
         synchronized (sLock) {
             binder = sCache.get(name);
         }
-        sLog.d(TAG, String.format("get service %s %s", name, binder));
         return binder;
     }
 
@@ -459,7 +458,7 @@ public final class XServiceManager {
             sLog.w(TAG, String.format("register service %s ignored — not system_server", name));
             return;
         }
-        sLog.d(TAG, String.format("register service %s %s", name, serviceFetcher));
+        sLog.d(TAG, String.format("register service name=%s deferred=true", name));
         boolean shouldCreateNow;
         synchronized (sLock) {
             IBinder existing = sCache.get(name);
@@ -628,6 +627,7 @@ public final class XServiceManager {
                     sLastError = null;
                 } else {
                     setLastError("clipboard bridge ping returned false");
+                    sLog.w(TAG, sLastError);
                 }
                 return ok;
             } finally {
@@ -708,6 +708,7 @@ public final class XServiceManager {
                 IBinder binder = _reply.readStrongBinder();
                 if (binder == null) {
                     setLastError(String.format("service %s is not registered in XServiceManager", name));
+                    sLog.w(TAG, sLastError);
                 } else {
                     sLastError = null;
                 }
