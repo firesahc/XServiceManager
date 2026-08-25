@@ -1,1 +1,4 @@
 /build
+gradle-daemon-jvm.properties
+.project
+.classpath
